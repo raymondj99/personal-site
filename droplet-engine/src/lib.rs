@@ -68,8 +68,8 @@ impl RainWorld {
     pub fn tick(&mut self) {
         self.frame = self.frame.wrapping_add(1);
 
-        // Gentle wind variation
-        self.wind = ((self.frame as f32) * 0.008).sin() * 0.2;
+        // No wind
+        self.wind = 0.0;
 
         // Clear output buffer (0 = empty, 1-3 = layer index + char)
         self.output.fill(0);
