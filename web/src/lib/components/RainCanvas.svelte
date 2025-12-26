@@ -2,11 +2,20 @@
     import { onMount, onDestroy } from "svelte";
     import { browser } from "$app/environment";
     import { createWorld, getMemory, type RainWorld } from "$lib/wasm/dropletEngine";
+    import { BG_WIDTH, BG_HEIGHT, BG_PALETTE, BG_PIXELS, BG_DEPTH } from "$lib/background";
 
     let canvas: HTMLCanvasElement;
     let ctx: CanvasRenderingContext2D;
     let world: RainWorld;
     let animationId: number;
+
+    // Pre-rendered canvases
+    let bgCanvas: HTMLCanvasElement | null = null;
+    let depthCanvas: HTMLCanvasElement | null = null;
+
+    // Visualization controls
+    let showDepth = false;
+    let depthOpacity = 0.5;
 
     const CHAR_W = 8;
     const CHAR_H = 16;
@@ -55,10 +64,68 @@
         if (!canvas) return;
         ctx = canvas.getContext('2d', { alpha: false })!;
         if (!ctx) return;
+
+        preRenderBackground();
+        preRenderDepth();
         await resize();
         window.addEventListener('resize', resize);
         loop();
     });
+
+    function preRenderBackground() {
+        bgCanvas = document.createElement('canvas');
+        bgCanvas.width = BG_WIDTH;
+        bgCanvas.height = BG_HEIGHT;
+        const bgCtx = bgCanvas.getContext('2d')!;
+
+        for (let y = 0; y < BG_HEIGHT; y++) {
+            for (let x = 0; x < BG_WIDTH; x++) {
+                const colorIdx = BG_PIXELS[y][x];
+                bgCtx.fillStyle = BG_PALETTE[colorIdx];
+                bgCtx.fillRect(x, y, 1, 1);
+            }
+        }
+    }
+
+    function preRenderDepth() {
+        depthCanvas = document.createElement('canvas');
+        depthCanvas.width = BG_WIDTH;
+        depthCanvas.height = BG_HEIGHT;
+        const depthCtx = depthCanvas.getContext('2d')!;
+
+        const imageData = depthCtx.createImageData(BG_WIDTH, BG_HEIGHT);
+        const data = imageData.data;
+
+        for (let y = 0; y < BG_HEIGHT; y++) {
+            for (let x = 0; x < BG_WIDTH; x++) {
+                const depth = BG_DEPTH[y][x];
+                const idx = (y * BG_WIDTH + x) * 4;
+                const t = depth / 255;
+
+                let r: number, g: number, b: number;
+                if (t < 0.25) {
+                    const s = t / 0.25;
+                    r = 0; g = Math.floor(s * 255); b = 255;
+                } else if (t < 0.5) {
+                    const s = (t - 0.25) / 0.25;
+                    r = 0; g = 255; b = Math.floor((1 - s) * 255);
+                } else if (t < 0.75) {
+                    const s = (t - 0.5) / 0.25;
+                    r = Math.floor(s * 255); g = 255; b = 0;
+                } else {
+                    const s = (t - 0.75) / 0.25;
+                    r = 255; g = Math.floor((1 - s) * 255); b = 0;
+                }
+
+                data[idx] = r;
+                data[idx + 1] = g;
+                data[idx + 2] = b;
+                data[idx + 3] = 255;
+            }
+        }
+
+        depthCtx.putImageData(imageData, 0, 0);
+    }
 
     onDestroy(() => {
         if (!browser) return;
@@ -107,8 +174,22 @@
 
         const buf = new Uint8Array(memory.buffer, ptr, len);
 
-        ctx.fillStyle = '#070709';
-        ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+        ctx.imageSmoothingEnabled = false;
+
+        // Draw background
+        if (bgCanvas) {
+            ctx.drawImage(bgCanvas, 0, 0, window.innerWidth, window.innerHeight);
+        } else {
+            ctx.fillStyle = '#0a0a12';
+            ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+        }
+
+        // Optionally overlay depth map
+        if (showDepth && depthCanvas) {
+            ctx.globalAlpha = depthOpacity;
+            ctx.drawImage(depthCanvas, 0, 0, window.innerWidth, window.innerHeight);
+            ctx.globalAlpha = 1.0;
+        }
 
         // Render drops
         for (let bucket = 0; bucket < BUCKETS; bucket++) {
@@ -143,11 +224,63 @@
                 }
             }
         }
+
+        // Draw legend if depth is shown
+        if (showDepth) {
+            drawDepthLegend();
+        }
+    }
+
+    function drawDepthLegend() {
+        const legendX = 20;
+        const legendY = 20;
+        const legendW = 200;
+        const legendH = 20;
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(legendX - 10, legendY - 30, legendW + 20, legendH + 50);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px monospace';
+        ctx.fillText('MiDaS Depth Map', legendX, legendY - 10);
+
+        const gradient = ctx.createLinearGradient(legendX, 0, legendX + legendW, 0);
+        gradient.addColorStop(0, 'rgb(0, 0, 255)');
+        gradient.addColorStop(0.25, 'rgb(0, 255, 255)');
+        gradient.addColorStop(0.5, 'rgb(0, 255, 0)');
+        gradient.addColorStop(0.75, 'rgb(255, 255, 0)');
+        gradient.addColorStop(1, 'rgb(255, 0, 0)');
+
+        ctx.fillStyle = gradient;
+        ctx.fillRect(legendX, legendY, legendW, legendH);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px monospace';
+        ctx.fillText('Far', legendX, legendY + legendH + 15);
+        ctx.fillText('Close', legendX + legendW - 30, legendY + legendH + 15);
+    }
+
+    function handleKeydown(e: KeyboardEvent) {
+        if (e.key === 'd' || e.key === 'D') {
+            showDepth = !showDepth;
+        } else if (e.key === 'ArrowUp' && showDepth) {
+            depthOpacity = Math.min(1, depthOpacity + 0.1);
+        } else if (e.key === 'ArrowDown' && showDepth) {
+            depthOpacity = Math.max(0, depthOpacity - 0.1);
+        }
     }
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
+
 {#if browser}
     <canvas bind:this={canvas}></canvas>
+    <div class="controls">
+        <p>Press <kbd>D</kbd> to toggle depth overlay</p>
+        {#if showDepth}
+            <p>Press <kbd>Up/Down</kbd> to adjust opacity</p>
+        {/if}
+    </div>
 {/if}
 
 <style>
@@ -158,5 +291,29 @@
         width: 100vw;
         height: 100vh;
         z-index: 0;
+    }
+
+    .controls {
+        position: fixed;
+        bottom: 20px;
+        right: 20px;
+        background: rgba(0, 0, 0, 0.7);
+        padding: 10px 15px;
+        border-radius: 8px;
+        color: #fff;
+        font-family: monospace;
+        font-size: 12px;
+        z-index: 10;
+    }
+
+    .controls p {
+        margin: 5px 0;
+    }
+
+    kbd {
+        background: rgba(255, 255, 255, 0.2);
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-family: inherit;
     }
 </style>
