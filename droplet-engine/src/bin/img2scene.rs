@@ -1,6 +1,13 @@
-// img2scene - Convert image to pixel art with MiDaS depth estimation
+// img2scene - Convert image to pixel art with depth estimation and geometry extraction
 //
 // Usage: cargo run --bin img2scene -- <image> [--cols 320] [--rows 180] [--colors 32]
+//
+// Outputs:
+//   - Pixel art with palette
+//   - Depth map (0-255, 0=far, 255=near)
+//   - Normal map (packed xy, derived from depth)
+//   - Flow field (packed xy, gradient-based water flow direction)
+//   - Ambient occlusion map (pre-baked lighting)
 
 use image::{DynamicImage, GenericImageView, imageops::FilterType};
 use ndarray::Array4;
@@ -288,10 +295,373 @@ fn generate_collision(depth: &[Vec<f32>], w: usize, h: usize) -> Vec<Vec<u8>> {
 }
 
 // ============================================================================
+// Ground mask from semantic segmentation
+// ============================================================================
+
+/// Compute ground mask from semantic segmentation.
+/// Ground surfaces are where water can flow: everything except sky, trees, and similar.
+/// Uses exclusion list approach - any surface not excluded is considered ground.
+fn compute_ground_mask(segments: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let h = segments.len();
+    let w = segments.get(0).map_or(0, |r| r.len());
+    let mut ground = vec![vec![0u8; w]; h];
+
+    // ADE20K classes that are NOT ground (water cannot flow on these)
+    const NON_GROUND_CLASSES: &[u8] = &[
+        2,   // sky
+        4,   // tree (vertical trunks, canopy)
+        17,  // plant (vertical vegetation)
+        72,  // palm tree
+    ];
+
+    let mut ground_count = 0;
+    for y in 0..h {
+        for x in 0..w {
+            let class = segments[y][x];
+            if !NON_GROUND_CLASSES.contains(&class) {
+                ground[y][x] = 1;
+                ground_count += 1;
+            }
+        }
+    }
+
+    let pct = ground_count as f32 / (w * h) as f32 * 100.0;
+    println!("    Ground coverage: {:.1}% ({} pixels)", pct, ground_count);
+
+    ground
+}
+
+// ============================================================================
+// Semantic segmentation using SegFormer (ADE20K - 150 classes)
+// ============================================================================
+
+/// ADE20K class labels for reference (used in visualization)
+/// Key natural scene classes:
+///   2=sky, 4=tree, 6=road, 9=grass, 13=earth, 16=mountain,
+///   21=water, 26=sea, 29=field, 34=rock, 46=sand, 52=path,
+///   60=river, 68=hill, 72=palm, 94=land, 113=waterfall, 128=lake
+
+fn estimate_segmentation(img: &DynamicImage, tw: u32, th: u32) -> Vec<Vec<u8>> {
+    const SEGFORMER_SIZE: u32 = 512;
+    let model_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/segformer_b0_ade20k.onnx");
+
+    if !model_path.exists() {
+        eprintln!("    SegFormer model not found, using fallback segmentation");
+        return fallback_segmentation(tw, th);
+    }
+
+    let Ok(builder) = Session::builder() else {
+        return fallback_segmentation(tw, th);
+    };
+    let Ok(mut session) = builder.commit_from_file(&model_path) else {
+        return fallback_segmentation(tw, th);
+    };
+
+    println!("    Running SegFormer semantic segmentation...");
+    let resized = img.resize_exact(SEGFORMER_SIZE, SEGFORMER_SIZE, FilterType::Lanczos3);
+
+    // ImageNet normalization (same as MiDaS)
+    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+    const STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+    let mut input = Array4::<f32>::zeros((1, 3, SEGFORMER_SIZE as usize, SEGFORMER_SIZE as usize));
+    for y in 0..SEGFORMER_SIZE {
+        for x in 0..SEGFORMER_SIZE {
+            let p = resized.get_pixel(x, y);
+            for c in 0..3 {
+                input[[0, c, y as usize, x as usize]] = (p[c] as f32 / 255.0 - MEAN[c]) / STD[c];
+            }
+        }
+    }
+
+    let Ok(input_val) = Value::from_array(input) else { return fallback_segmentation(tw, th); };
+    let input_name = session.inputs.first().map(|i| i.name.clone()).unwrap_or_else(|| "pixel_values".into());
+    let Ok(outputs) = session.run(ort::inputs![input_name => input_val]) else { return fallback_segmentation(tw, th); };
+    let Ok(arr) = outputs[0].try_extract_array::<f32>() else { return fallback_segmentation(tw, th); };
+
+    let shape = arr.shape();
+    // SegFormer output: (1, num_classes, H/4, W/4) = (1, 150, 128, 128)
+    let (num_classes, oh, ow) = match shape.len() {
+        4 => (shape[1], shape[2], shape[3]),
+        3 => (shape[0], shape[1], shape[2]),
+        _ => return fallback_segmentation(tw, th),
+    };
+
+    // Argmax over classes for each pixel
+    let flat: Vec<f32> = arr.iter().copied().collect();
+    let mut seg_map = vec![vec![0u8; ow]; oh];
+
+    for y in 0..oh {
+        for x in 0..ow {
+            let mut max_val = f32::MIN;
+            let mut max_class = 0u8;
+            for c in 0..num_classes {
+                let idx = c * oh * ow + y * ow + x;
+                let val = flat.get(idx).copied().unwrap_or(f32::MIN);
+                if val > max_val {
+                    max_val = val;
+                    max_class = c as u8;
+                }
+            }
+            seg_map[y][x] = max_class;
+        }
+    }
+
+    // Bilinear resize to target dimensions
+    let (sx, sy) = (ow as f32 / tw as f32, oh as f32 / th as f32);
+    let mut segments = vec![vec![0u8; tw as usize]; th as usize];
+
+    for y in 0..th as usize {
+        for x in 0..tw as usize {
+            // Nearest neighbor for class labels (bilinear doesn't make sense for discrete classes)
+            let src_x = ((x as f32 + 0.5) * sx) as usize;
+            let src_y = ((y as f32 + 0.5) * sy) as usize;
+            let src_x = src_x.min(ow - 1);
+            let src_y = src_y.min(oh - 1);
+            segments[y][x] = seg_map[src_y][src_x];
+        }
+    }
+
+    // Count unique classes for logging
+    let mut class_counts = [0u32; 150];
+    for row in &segments {
+        for &c in row {
+            if (c as usize) < 150 {
+                class_counts[c as usize] += 1;
+            }
+        }
+    }
+    let unique_classes: Vec<u8> = class_counts.iter().enumerate()
+        .filter(|&(_, count)| *count > 0)
+        .map(|(i, _)| i as u8)
+        .collect();
+    println!("    Found {} unique semantic classes", unique_classes.len());
+
+    segments
+}
+
+fn fallback_segmentation(w: u32, h: u32) -> Vec<Vec<u8>> {
+    // Simple fallback: sky at top (class 2), ground at bottom (class 13=earth)
+    (0..h as usize).map(|y| {
+        let class = if y < (h as usize / 3) { 2u8 } else { 13u8 }; // sky vs earth
+        vec![class; w as usize]
+    }).collect()
+}
+
+// ============================================================================
+// Normal map extraction (derived from depth)
+// ============================================================================
+
+/// Compute surface normals from depth map using central differences.
+/// Returns (nx, ny) packed as i8 values (-127 to 127).
+/// nz is implicit: nz = sqrt(1 - nx^2 - ny^2)
+fn compute_normals(depth: &[Vec<f32>], scale: f32) -> (Vec<Vec<i8>>, Vec<Vec<i8>>) {
+    let h = depth.len();
+    let w = depth.get(0).map_or(0, |r| r.len());
+
+    let mut nx = vec![vec![0i8; w]; h];
+    let mut ny = vec![vec![0i8; w]; h];
+
+    for y in 1..h.saturating_sub(1) {
+        for x in 1..w.saturating_sub(1) {
+            // Central differences for gradient
+            let dzdx = (depth[y][x + 1] - depth[y][x - 1]) * scale;
+            let dzdy = (depth[y + 1][x] - depth[y - 1][x]) * scale;
+
+            // Normal = normalize(-dzdx, -dzdy, 1.0)
+            let len = (dzdx * dzdx + dzdy * dzdy + 1.0).sqrt();
+            let norm_x = -dzdx / len;
+            let norm_y = -dzdy / len;
+
+            // Pack to i8 range (-127 to 127)
+            nx[y][x] = (norm_x * 127.0).clamp(-127.0, 127.0) as i8;
+            ny[y][x] = (norm_y * 127.0).clamp(-127.0, 127.0) as i8;
+        }
+    }
+
+    // Fill edges by copying neighbors
+    for y in 0..h {
+        nx[y][0] = nx[y][1.min(w - 1)];
+        ny[y][0] = ny[y][1.min(w - 1)];
+        nx[y][w - 1] = nx[y][w.saturating_sub(2)];
+        ny[y][w - 1] = ny[y][w.saturating_sub(2)];
+    }
+    for x in 0..w {
+        nx[0][x] = nx[1.min(h - 1)][x];
+        ny[0][x] = ny[1.min(h - 1)][x];
+        nx[h - 1][x] = nx[h.saturating_sub(2)][x];
+        ny[h - 1][x] = ny[h.saturating_sub(2)][x];
+    }
+
+    (nx, ny)
+}
+
+// ============================================================================
+// Flow field computation (depth gradient + gravity)
+// ============================================================================
+
+/// Compute flow direction using depth gradient with horizontal boost.
+/// Only computes flow on ground surfaces (where ground mask is 1).
+///
+/// On tilted surfaces (like stairs), water flows towards the camera AND downward.
+/// The depth gradient captures the "towards camera" direction.
+/// We boost the horizontal component because typical scenes have diagonal slopes.
+///
+/// Key insight: depth increases towards the camera along the surface slope,
+/// so the depth gradient direction approximates the downhill flow direction.
+///
+/// Returns (fx, fy) as i8 values (-127 to 127), representing flow direction.
+/// Non-ground areas have (0, 0) to indicate no flow.
+fn compute_flow_field(depth: &[Vec<f32>], ground: &[Vec<u8>]) -> (Vec<Vec<i8>>, Vec<Vec<i8>>) {
+    let h = depth.len();
+    let w = depth.get(0).map_or(0, |r| r.len());
+
+    let mut fx = vec![vec![0i8; w]; h];
+    let mut fy = vec![vec![0i8; w]; h];
+
+    // Multi-scale depth gradient with horizontal boost
+    // Larger scales capture the overall slope direction
+    let scales: [(i32, f32); 3] = [
+        (2, 0.25),   // Fine scale
+        (5, 0.40),   // Medium scale
+        (10, 0.35),  // Coarse scale (captures diagonal stairs better)
+    ];
+
+    // Horizontal boost factor: amplify horizontal depth changes
+    // because typical scenes have diagonal slopes that MiDaS underestimates
+    let horizontal_boost = 2.5_f32;
+
+    let margin = 10;
+    for y in margin..h.saturating_sub(margin) {
+        for x in margin..w.saturating_sub(margin) {
+            // Only compute flow on ground surfaces
+            if ground[y][x] == 0 {
+                fx[y][x] = 0;
+                fy[y][x] = 0;
+                continue;
+            }
+
+            let mut grad_x = 0.0f32;
+            let mut grad_y = 0.0f32;
+
+            // Accumulate depth gradients at multiple scales
+            for &(offset, weight) in &scales {
+                let o = offset as usize;
+
+                // Central difference of depth
+                // Positive gradient = depth increases in that direction = closer to camera
+                let dx = depth[y][x + o] - depth[y][x - o];
+                let dy = depth[y + o][x] - depth[y - o][x];
+
+                // Water flows TOWARDS higher depth (closer to camera)
+                // Boost horizontal component to capture diagonal slopes
+                grad_x += dx * weight * horizontal_boost;
+                grad_y += dy * weight;
+            }
+
+            // Add gravity component (water always tends to flow down)
+            let gravity = 0.02_f32;
+            grad_y += gravity;
+
+            // Normalize and convert to flow direction
+            let len = (grad_x * grad_x + grad_y * grad_y).sqrt();
+
+            if len > 0.001 {
+                let norm_x = grad_x / len;
+                let norm_y = grad_y / len;
+
+                // Flow strength based on gradient magnitude
+                let strength = (len * 8.0 + 0.4).min(1.0);
+
+                fx[y][x] = (norm_x * strength * 127.0).clamp(-127.0, 127.0) as i8;
+                fy[y][x] = (norm_y * strength * 127.0).clamp(-127.0, 127.0) as i8;
+            } else {
+                // Flat ground area: pure gravity (straight down)
+                fx[y][x] = 0;
+                fy[y][x] = 51;
+            }
+        }
+    }
+
+    // Edges are non-ground
+    for y in 0..h {
+        for x in 0..w {
+            if y < margin || y >= h - margin || x < margin || x >= w - margin {
+                fx[y][x] = 0;
+                fy[y][x] = 0;
+            }
+        }
+    }
+
+    (fx, fy)
+}
+
+// ============================================================================
+// Ambient occlusion computation
+// ============================================================================
+
+/// Compute screen-space ambient occlusion from depth.
+/// Areas surrounded by closer geometry are darker.
+fn compute_ao(depth: &[Vec<f32>], radius: usize) -> Vec<Vec<u8>> {
+    let h = depth.len();
+    let w = depth.get(0).map_or(0, |r| r.len());
+    let mut ao = vec![vec![255u8; w]; h];
+
+    let r = radius as i32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let center_depth = depth[y][x];
+            let mut occlusion = 0.0f32;
+            let mut samples = 0;
+
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+
+                    let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                    let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                    let sample_depth = depth[sy][sx];
+
+                    // If sample is closer (higher depth value), it occludes
+                    if sample_depth > center_depth {
+                        let diff = (sample_depth - center_depth).min(0.15);
+                        // Weight by distance
+                        let dist = ((dx * dx + dy * dy) as f32).sqrt();
+                        occlusion += diff / (1.0 + dist * 0.5);
+                    }
+                    samples += 1;
+                }
+            }
+
+            // Convert occlusion to AO value (255 = fully lit, 0 = fully occluded)
+            let ao_factor = 1.0 - (occlusion / samples as f32 * 8.0).min(0.7);
+            ao[y][x] = (ao_factor * 255.0) as u8;
+        }
+    }
+
+    ao
+}
+
+// ============================================================================
 // File generation
 // ============================================================================
 
-fn write_rust(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], depth: &[Vec<u8>]) {
+/// Scene geometry data for output
+struct SceneGeometry {
+    depth: Vec<Vec<u8>>,
+    normal_x: Vec<Vec<i8>>,
+    normal_y: Vec<Vec<i8>>,
+    flow_x: Vec<Vec<i8>>,
+    flow_y: Vec<Vec<i8>>,
+    ao: Vec<Vec<u8>>,
+    segments: Vec<Vec<u8>>,
+    ground: Vec<Vec<u8>>,  // Ground mask: 1 = ground surface, 0 = non-ground
+}
+
+fn write_rust(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], geom: &SceneGeometry) {
     let (h, w) = (pixels.len(), pixels.get(0).map_or(0, |r| r.len()));
     let mut f = BufWriter::new(File::create(path).expect("create rust file"));
 
@@ -305,13 +675,23 @@ fn write_rust(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], depth: &[
     for (r, g, b) in palette { writeln!(f, "    ({},{},{}),", r, g, b).unwrap(); }
     writeln!(f, "];\n").unwrap();
 
-    write_array(&mut f, "BG_PIXELS", pixels);
-    write_array(&mut f, "BG_DEPTH", depth);
+    // Visual data
+    write_array_u8(&mut f, "BG_PIXELS", pixels);
+
+    // Geometry data
+    write_array_u8(&mut f, "BG_DEPTH", &geom.depth);
+    write_array_i8(&mut f, "BG_NORMAL_X", &geom.normal_x);
+    write_array_i8(&mut f, "BG_NORMAL_Y", &geom.normal_y);
+    write_array_i8(&mut f, "BG_FLOW_X", &geom.flow_x);
+    write_array_i8(&mut f, "BG_FLOW_Y", &geom.flow_y);
+    write_array_u8(&mut f, "BG_AO", &geom.ao);
+    write_array_u8(&mut f, "BG_SEGMENTS", &geom.segments);
+    write_array_u8(&mut f, "BG_GROUND", &geom.ground);
 
     println!("  Generated {}", path.display());
 }
 
-fn write_array<W: Write>(f: &mut W, name: &str, data: &[Vec<u8>]) {
+fn write_array_u8<W: Write>(f: &mut W, name: &str, data: &[Vec<u8>]) {
     let (h, w) = (data.len(), data.get(0).map_or(0, |r| r.len()));
     writeln!(f, "pub static {}: [[u8; {}]; {}] = [", name, w, h).unwrap();
     for row in data {
@@ -325,7 +705,21 @@ fn write_array<W: Write>(f: &mut W, name: &str, data: &[Vec<u8>]) {
     writeln!(f, "];\n").unwrap();
 }
 
-fn write_ts(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], depth: &[Vec<u8>]) {
+fn write_array_i8<W: Write>(f: &mut W, name: &str, data: &[Vec<i8>]) {
+    let (h, w) = (data.len(), data.get(0).map_or(0, |r| r.len()));
+    writeln!(f, "pub static {}: [[i8; {}]; {}] = [", name, w, h).unwrap();
+    for row in data {
+        write!(f, "    [").unwrap();
+        for (i, v) in row.iter().enumerate() {
+            if i > 0 { write!(f, ",").unwrap(); }
+            write!(f, "{}", v).unwrap();
+        }
+        writeln!(f, "],").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
+}
+
+fn write_ts(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], geom: &SceneGeometry) {
     let (h, w) = (pixels.len(), pixels.get(0).map_or(0, |r| r.len()));
     let mut f = BufWriter::new(File::create(path).expect("create ts file"));
 
@@ -337,13 +731,36 @@ fn write_ts(path: &Path, palette: &[(u8,u8,u8)], pixels: &[Vec<u8>], depth: &[Ve
     for (r, g, b) in palette { writeln!(f, "  '#{:02x}{:02x}{:02x}',", r, g, b).unwrap(); }
     writeln!(f, "];\n").unwrap();
 
-    write_ts_array(&mut f, "BG_PIXELS", pixels);
-    write_ts_array(&mut f, "BG_DEPTH", depth);
+    // Visual data
+    write_ts_array_u8(&mut f, "BG_PIXELS", pixels);
+
+    // Geometry data
+    write_ts_array_u8(&mut f, "BG_DEPTH", &geom.depth);
+    write_ts_array_i8(&mut f, "BG_NORMAL_X", &geom.normal_x);
+    write_ts_array_i8(&mut f, "BG_NORMAL_Y", &geom.normal_y);
+    write_ts_array_i8(&mut f, "BG_FLOW_X", &geom.flow_x);
+    write_ts_array_i8(&mut f, "BG_FLOW_Y", &geom.flow_y);
+    write_ts_array_u8(&mut f, "BG_AO", &geom.ao);
+    write_ts_array_u8(&mut f, "BG_SEGMENTS", &geom.segments);
+    write_ts_array_u8(&mut f, "BG_GROUND", &geom.ground);
 
     println!("  Generated {}", path.display());
 }
 
-fn write_ts_array<W: Write>(f: &mut W, name: &str, data: &[Vec<u8>]) {
+fn write_ts_array_u8<W: Write>(f: &mut W, name: &str, data: &[Vec<u8>]) {
+    writeln!(f, "export const {}: number[][] = [", name).unwrap();
+    for row in data {
+        write!(f, "  [").unwrap();
+        for (i, v) in row.iter().enumerate() {
+            if i > 0 { write!(f, ",").unwrap(); }
+            write!(f, "{}", v).unwrap();
+        }
+        writeln!(f, "],").unwrap();
+    }
+    writeln!(f, "];\n").unwrap();
+}
+
+fn write_ts_array_i8<W: Write>(f: &mut W, name: &str, data: &[Vec<i8>]) {
     writeln!(f, "export const {}: number[][] = [", name).unwrap();
     for row in data {
         write!(f, "  [").unwrap();
@@ -405,18 +822,53 @@ fn main() {
     println!("  Dithering...");
     let indexed = floyd_steinberg(&mut pixels, &palette);
 
-    // Depth + collision
+    // Depth estimation
     println!("  Depth estimation...");
     let depth_f = estimate_depth(&resized, cols, rows);
     let depth_u8: Vec<Vec<u8>> = depth_f.iter()
         .map(|row| row.iter().map(|&d| (d * 255.0) as u8).collect())
         .collect();
 
-    let _collision = generate_collision(&depth_f, cols as usize, rows as usize);
+    // Normal map (derived from depth) - used for splash direction
+    println!("  Computing surface normals...");
+    let normal_scale = 50.0; // Tunable: higher = more pronounced normals
+    let (normal_x, normal_y) = compute_normals(&depth_f, normal_scale);
+
+    // Ambient occlusion
+    println!("  Computing ambient occlusion...");
+    let ao = compute_ao(&depth_f, 3); // radius=3 pixels
+
+    // Semantic segmentation (ML-based using SegFormer) - needed for ground mask
+    println!("  Computing semantic segmentation...");
+    let segments = estimate_segmentation(&resized, cols, rows);
+
+    // Ground mask (from semantic segmentation) - surfaces where water flows
+    println!("  Computing ground mask...");
+    let ground = compute_ground_mask(&segments);
+
+    // Flow field (elevation gradient) - only computed on ground surfaces
+    println!("  Computing elevation gradient...");
+    let (flow_x, flow_y) = compute_flow_field(&depth_f, &ground);
+
+    // Bundle geometry
+    let geom = SceneGeometry {
+        depth: depth_u8,
+        normal_x,
+        normal_y,
+        flow_x,
+        flow_y,
+        ao,
+        segments,
+        ground,
+    };
+
+    // Memory estimate
+    let mem_kb = (cols * rows * 7) / 1024; // 7 bytes per pixel (depth + nx + ny + fx + fy + ao + pixels)
+    println!("  Geometry size: ~{} KB", mem_kb);
 
     // Write output
-    write_rust(Path::new("src/background.rs"), &rgb_palette, &indexed, &depth_u8);
-    write_ts(Path::new("../web/src/lib/background.ts"), &rgb_palette, &indexed, &depth_u8);
+    write_rust(Path::new("src/background.rs"), &rgb_palette, &indexed, &geom);
+    write_ts(Path::new("../web/src/lib/background.ts"), &rgb_palette, &indexed, &geom);
 
     println!("Done!");
 }

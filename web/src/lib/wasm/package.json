@@ -1,0 +1,13 @@
+{
+  "name": "droplet-engine",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "droplet_engine.js",
+  "types": "droplet_engine.d.ts",
+  "files": [
+    "droplet_engine.js",
+    "droplet_engine.d.ts",
+    "droplet_engine_bg.wasm",
+    "droplet_engine_bg.wasm.d.ts"
+  ]
+}

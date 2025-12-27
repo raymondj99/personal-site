@@ -1,11 +1,13 @@
 use wasm_bindgen::prelude::*;
 
 mod background;
-use background::{BG_WIDTH, BG_HEIGHT, BG_DEPTH};
+#[allow(unused_imports)]
+use background::{BG_WIDTH, BG_HEIGHT, BG_DEPTH, BG_NORMAL_X, BG_NORMAL_Y, BG_FLOW_X, BG_FLOW_Y, BG_AO};
 
 // Capacity
 const MAX_DROPS: usize = 3000;
 const MAX_SPLASHES: usize = 200;
+const MAX_STREAMS: usize = 500;  // Sliding water particles
 
 // Physics
 const GROUND_NEAR: f32 = 1.0;
@@ -15,8 +17,14 @@ const VEL_FAR: f32 = 0.25;
 const SPLASH_CHANCE: f32 = 0.7;
 const DEPTH_MARGIN: u8 = 48;
 
+// Flow physics
+const FLOW_SPEED: f32 = 0.4;        // Base speed for sliding water
+const FLOW_LIFETIME: u8 = 120;      // Frames before stream particle dies
+const SLIDE_CHANCE: f32 = 0.6;      // Chance to create sliding particle on surface hit
+
 // Encoding: 1-32 = drops (8 depths × 4 trail), 33-96 = splashes (8 depths × 8 chars)
 const SPLASH_OFFSET: u8 = 33;
+const STREAM_OFFSET: u8 = 97;       // 97-128 = streams (8 depths × 4 sizes)
 
 #[wasm_bindgen]
 pub struct RainWorld {
@@ -42,6 +50,13 @@ pub struct RainWorld {
     st: [u8; MAX_SPLASHES],   // type (0-3)
     sn: usize,
 
+    // Streams - sliding water particles (SoA)
+    stx: [f32; MAX_STREAMS],  // position x
+    sty: [f32; MAX_STREAMS],  // position y
+    stz: [f32; MAX_STREAMS],  // depth
+    stl: [u8; MAX_STREAMS],   // lifetime remaining
+    stn: usize,
+
     out: Vec<u8>,
     rng: u32,
 }
@@ -66,6 +81,11 @@ impl RainWorld {
             sd: [0; MAX_SPLASHES],
             st: [0; MAX_SPLASHES],
             sn: 0,
+            stx: [0.0; MAX_STREAMS],
+            sty: [0.0; MAX_STREAMS],
+            stz: [0.0; MAX_STREAMS],
+            stl: [0; MAX_STREAMS],
+            stn: 0,
             out: vec![0; (w * h) as usize],
             rng: 0xDEADBEEF,
         }
@@ -79,6 +99,7 @@ impl RainWorld {
         self.out.resize((w * h) as usize, 0);
         self.dn = 0;
         self.sn = 0;
+        self.stn = 0;
     }
 
     pub fn tick(&mut self) {
@@ -86,6 +107,7 @@ impl RainWorld {
         self.spawn();
         self.update_drops();
         self.update_splashes();
+        self.update_streams();
         self.render();
     }
 
@@ -112,6 +134,28 @@ impl RainWorld {
         let drop_depth = ((1.0 - drop_z) * 255.0) as u8;
         let diff = (drop_depth as i16 - bg_depth as i16).unsigned_abs() as u8;
         diff < DEPTH_MARGIN
+    }
+
+    /// Get flow direction at a screen position, returns (fx, fy) as floats in [-1, 1]
+    #[inline(always)]
+    fn get_flow(&self, x: f32, y: f32) -> (f32, f32) {
+        let bx = ((x * self.scale_x) as usize).min(BG_WIDTH - 1);
+        let by = ((y * self.scale_y) as usize).min(BG_HEIGHT - 1);
+
+        let fx = BG_FLOW_X[by][bx] as f32 / 127.0;
+        let fy = BG_FLOW_Y[by][bx] as f32 / 127.0;
+        (fx, fy)
+    }
+
+    /// Check if there's significant flow at this position (not flat)
+    #[inline(always)]
+    fn has_flow(&self, x: f32, y: f32) -> bool {
+        let bx = ((x * self.scale_x) as usize).min(BG_WIDTH - 1);
+        let by = ((y * self.scale_y) as usize).min(BG_HEIGHT - 1);
+
+        let fx = BG_FLOW_X[by][bx].abs();
+        let fy = BG_FLOW_Y[by][bx].abs();
+        fx > 10 || fy > 10  // Threshold for "has flow"
     }
 
     fn spawn(&mut self) {
@@ -146,6 +190,11 @@ impl RainWorld {
 
             // Check surface collision (only if on screen)
             if y >= 0.0 && y < hf && x >= 0.0 && x < wf && self.hits_surface(x, y, z) {
+                // Check if surface has slope (flow)
+                if self.has_flow(x, y) && self.rand() < SLIDE_CHANCE {
+                    // Spawn sliding water particle
+                    self.spawn_stream(x, y, z);
+                }
                 self.spawn_splash(x, y, z, 3); // spray type
                 continue;
             }
@@ -199,6 +248,72 @@ impl RainWorld {
         self.sn = w;
     }
 
+    #[inline]
+    fn spawn_stream(&mut self, x: f32, y: f32, z: f32) {
+        if self.stn >= MAX_STREAMS { return; }
+        let n = self.stn;
+        self.stx[n] = x;
+        self.sty[n] = y;
+        self.stz[n] = z;
+        self.stl[n] = FLOW_LIFETIME;
+        self.stn += 1;
+    }
+
+    fn update_streams(&mut self) {
+        let hf = self.h as f32;
+        let wf = self.w as f32;
+        let mut w = 0;
+
+        for r in 0..self.stn {
+            let mut x = self.stx[r];
+            let mut y = self.sty[r];
+            let z = self.stz[r];
+            let life = self.stl[r];
+
+            // Decrease lifetime
+            if life == 0 {
+                continue;
+            }
+
+            // Get flow direction at current position
+            let (fx, fy) = self.get_flow(x, y);
+
+            // Move along flow field (scale by depth for perspective)
+            let speed = FLOW_SPEED * (1.0 - z * 0.5); // Slower when far
+            x += fx * speed;
+            y += fy * speed;
+
+            // Check bounds
+            if x < 0.0 || x >= wf || y < 0.0 || y >= hf {
+                continue;
+            }
+
+            // Check if we're still on a surface
+            if !self.hits_surface(x, y, z) {
+                // Fell off the surface - spawn a small splash and remove
+                if life > 60 {
+                    self.spawn_splash(x, y, z, 2);
+                }
+                continue;
+            }
+
+            // Check if flow has stopped (reached flat area/pool)
+            if !self.has_flow(x, y) {
+                // Reached a pool area - create ripple and remove
+                self.spawn_splash(x, y, z, 0);
+                continue;
+            }
+
+            // Keep sliding
+            self.stx[w] = x;
+            self.sty[w] = y;
+            self.stz[w] = z;
+            self.stl[w] = life - 1;
+            w += 1;
+        }
+        self.stn = w;
+    }
+
     fn render(&mut self) {
         let (w, h) = (self.w as i32, self.h as i32);
 
@@ -233,6 +348,25 @@ impl RainWorld {
             let dir = self.sd[i] as i32;
 
             self.render_splash_frame(x, y, bucket, scale, frame, dir, self.st[i], w, h);
+        }
+
+        // Render streams (sliding water)
+        for i in 0..self.stn {
+            let x = self.stx[i] as i32;
+            let y = self.sty[i] as i32;
+            let z = self.stz[i];
+
+            if x < 0 || x >= w || y < 0 || y >= h { continue; }
+
+            let bucket = (((1.0 - z) * 8.0) as u8).min(7);
+            let life = self.stl[i];
+
+            // Size varies with lifetime (smaller as it ages)
+            let size = if life > 80 { 3 } else if life > 40 { 2 } else if life > 10 { 1 } else { 0 };
+
+            let idx = (y * w + x) as usize;
+            let enc = STREAM_OFFSET + bucket * 4 + size;
+            if enc > self.out[idx] { self.out[idx] = enc; }
         }
     }
 
