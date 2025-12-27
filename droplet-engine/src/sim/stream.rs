@@ -65,8 +65,8 @@ impl Streams {
             let life = self.life[read];
             if life == 0 { continue; }
 
-            let mut x = self.x[read];
-            let mut y = self.y[read];
+            let x = self.x[read];
+            let y = self.y[read];
             let z = self.z[read];
 
             // Get flow at current position
@@ -76,18 +76,15 @@ impl Streams {
 
             // Move along flow (slower when far for perspective)
             let speed = FLOW_SPEED * (1.0 - z * 0.5);
-            x += fx * speed;
-            y += fy * speed;
+            let new_x = x + fx * speed;
+            let new_y = y + fy * speed;
 
             // Check bounds
-            if x < 0.0 || x >= screen_w || y < 0.0 || y >= screen_h {
+            if new_x < 0.0 || new_x >= screen_w || new_y < 0.0 || new_y >= screen_h {
                 continue;
             }
 
-            // Check if still on surface
-            let bx = (x * scale_x) as usize;
-            let by = (y * scale_y) as usize;
-
+            // Check if still on surface (reuse bx/by for nearby position - close enough)
             if !hits_surface(bx, by, z, DEPTH_MARGIN) {
                 // Fell off - splash
                 if life > 60 {
@@ -98,13 +95,13 @@ impl Streams {
 
             // Check if flow stopped (reached pool)
             if !has_flow(bx, by) {
-                splashes.spawn(x, y, z, 0, &mut rng);
+                splashes.spawn(new_x, new_y, z, 0, &mut rng);
                 continue;
             }
 
             // Keep sliding
-            self.x[write] = x;
-            self.y[write] = y;
+            self.x[write] = new_x;
+            self.y[write] = new_y;
             self.z[write] = z;
             self.life[write] = life - 1;
             write += 1;

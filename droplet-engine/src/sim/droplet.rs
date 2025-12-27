@@ -3,13 +3,13 @@
 // Structure-of-Arrays layout for cache-friendly iteration.
 
 use super::{MAX_DROPS, RainWorld, Splashes, Streams};
-use crate::world::{hits_surface, has_flow};
+use crate::world::{hits_surface, has_flow, get_normal};
 
 // Physics constants
 const GROUND_NEAR: f32 = 1.0;
 const GROUND_FAR: f32 = 0.4;
-const VEL_NEAR: f32 = 1.2;
-const VEL_FAR: f32 = 0.25;
+const VEL_NEAR: f32 = 1.7;   // Near drops fall fast
+const VEL_FAR: f32 = 0.35;   // Far drops fall slow (perspective)
 const SPLASH_CHANCE: f32 = 0.7;
 const DEPTH_MARGIN: u8 = 48;
 const SLIDE_CHANCE: f32 = 0.6;
@@ -90,11 +90,12 @@ impl Droplets {
             // Surface collision (only if on screen)
             if y >= 0.0 && y < screen_h && x >= 0.0 && x < screen_w {
                 if hits_surface(bx, by, z, DEPTH_MARGIN) {
-                    // Hit a surface - spawn splash
+                    // Hit a surface - spawn splash biased by surface normal
                     if has_flow(bx, by) && RainWorld::rand(rng) < SLIDE_CHANCE {
                         streams.spawn(x, y, z);
                     }
-                    splashes.spawn(x, y, z, 3, rng); // spray type
+                    let (nx, ny) = get_normal(bx, by);
+                    splashes.spawn_with_normal(x, y, z, nx, ny, rng);
                     continue;
                 }
             }

@@ -14,9 +14,9 @@ if [ -n "$1" ]; then
     echo ""
 fi
 
-# Check if background.rs exists
-if [ ! -f "src/background.rs" ]; then
-    echo "Error: src/background.rs not found"
+# Check if scene data exists
+if [ ! -f "src/scene/data.rs" ]; then
+    echo "Error: src/scene/data.rs not found"
     echo ""
     echo "Usage: $0 <image_path> [--cols N] [--rows N] [--colors N]"
     echo ""

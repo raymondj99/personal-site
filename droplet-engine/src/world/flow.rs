@@ -7,7 +7,7 @@ use crate::scene::{BG_WIDTH, BG_HEIGHT, BG_FLOW_X, BG_FLOW_Y};
 
 /// Flow direction at pixel, returns (fx, fy) in range [-1.0, 1.0]
 /// Returns (0, 0) if no flow (flat or non-ground)
-#[inline]
+#[inline(always)]
 pub fn get_flow(x: usize, y: usize) -> (f32, f32) {
     if x >= BG_WIDTH || y >= BG_HEIGHT { return (0.0, 0.0); }
 
@@ -18,7 +18,7 @@ pub fn get_flow(x: usize, y: usize) -> (f32, f32) {
 
 /// Check if there's significant flow at this position
 /// Returns false for flat areas where water would pool
-#[inline]
+#[inline(always)]
 pub fn has_flow(x: usize, y: usize) -> bool {
     if x >= BG_WIDTH || y >= BG_HEIGHT { return false; }
 

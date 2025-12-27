@@ -2,12 +2,17 @@
     import { onMount, onDestroy } from "svelte";
     import { browser } from "$app/environment";
     import { createWorld, getMemory, type RainWorld } from "$lib/wasm/dropletEngine";
-    import { BG_WIDTH, BG_HEIGHT, BG_PALETTE, BG_PIXELS, BG_DEPTH, BG_FLOW_X, BG_FLOW_Y, BG_SEGMENTS, BG_GROUND } from "$lib/scene";
+    import { BG_WIDTH, BG_HEIGHT, BG_PALETTE, BG_PIXELS, BG_DEPTH, BG_FLOW_X, BG_FLOW_Y, BG_SEGMENTS, BG_GROUND, BG_NORMAL_X, BG_NORMAL_Y } from "$lib/scene";
 
     let canvas: HTMLCanvasElement;
     let ctx: CanvasRenderingContext2D;
     let world: RainWorld;
     let animationId: number;
+
+    // FPS tracking
+    let fps = 0;
+    let frameCount = 0;
+    let lastFpsTime = 0;
 
     // Pre-rendered canvases
     let bgCanvas: HTMLCanvasElement | null = null;
@@ -15,12 +20,14 @@
     let flowCanvas: HTMLCanvasElement | null = null;
     let segmentCanvas: HTMLCanvasElement | null = null;
     let groundCanvas: HTMLCanvasElement | null = null;
+    let normalCanvas: HTMLCanvasElement | null = null;
 
     // Visualization controls
     let showDepth = false;
     let showFlow = false;
     let showSegments = false;
     let showGround = false;
+    let showNormals = false;
     let overlayOpacity = 0.6;
 
     const CHAR_W = 8;
@@ -77,9 +84,11 @@
         preRenderFlow();
         preRenderSegments();
         preRenderGround();
+        preRenderNormals();
         await resize();
         window.addEventListener('resize', resize);
-        loop();
+        lastFpsTime = performance.now();
+        animationId = requestAnimationFrame(loop);
     });
 
     function preRenderBackground() {
@@ -480,6 +489,113 @@
         groundCtx.putImageData(imageData, 0, 0);
     }
 
+    function preRenderNormals() {
+        normalCanvas = document.createElement('canvas');
+        normalCanvas.width = BG_WIDTH;
+        normalCanvas.height = BG_HEIGHT;
+        const normalCtx = normalCanvas.getContext('2d')!;
+
+        const imageData = normalCtx.createImageData(BG_WIDTH, BG_HEIGHT);
+        const data = imageData.data;
+
+        for (let y = 0; y < BG_HEIGHT; y++) {
+            for (let x = 0; x < BG_WIDTH; x++) {
+                const idx = (y * BG_WIDTH + x) * 4;
+
+                // Get normal components (-127 to 127 -> -1 to 1)
+                const nx = BG_NORMAL_X[y][x] / 127.0;
+                const ny = BG_NORMAL_Y[y][x] / 127.0;
+
+                // Map normal to RGB (standard normal map encoding)
+                // X: -1 to 1 -> 0 to 255 (red)
+                // Y: -1 to 1 -> 0 to 255 (green)
+                // Z (implied, pointing up): blue channel
+                const nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny));
+
+                data[idx] = Math.floor((nx * 0.5 + 0.5) * 255);     // R = X
+                data[idx + 1] = Math.floor((ny * 0.5 + 0.5) * 255); // G = Y
+                data[idx + 2] = Math.floor((nz * 0.5 + 0.5) * 255); // B = Z
+                data[idx + 3] = 255;
+            }
+        }
+
+        normalCtx.putImageData(imageData, 0, 0);
+    }
+
+    function renderNormalArrows() {
+        const screenW = window.innerWidth;
+        const screenH = window.innerHeight;
+
+        // Scale factors from background to screen
+        const scaleX = screenW / BG_WIDTH;
+        const scaleY = screenH / BG_HEIGHT;
+
+        // Grid spacing in background pixels
+        const bgSpacing = 10;
+        const arrowLength = 18;
+
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+
+        for (let bgY = bgSpacing / 2; bgY < BG_HEIGHT; bgY += bgSpacing) {
+            for (let bgX = bgSpacing / 2; bgX < BG_WIDTH; bgX += bgSpacing) {
+                const iy = Math.floor(bgY);
+                const ix = Math.floor(bgX);
+
+                const nx = BG_NORMAL_X[iy][ix] / 127.0;
+                const ny = BG_NORMAL_Y[iy][ix] / 127.0;
+
+                // Skip nearly vertical normals (flat surfaces)
+                const horizontalMag = Math.sqrt(nx * nx + ny * ny);
+                if (horizontalMag < 0.15) continue;
+
+                // Arrow shows the horizontal component of the normal
+                const dirX = nx / horizontalMag;
+                const dirY = ny / horizontalMag;
+
+                // Arrow length proportional to tilt
+                const len = arrowLength * Math.min(horizontalMag * 2, 1);
+
+                // Convert to screen coordinates
+                const screenX = bgX * scaleX;
+                const screenY = bgY * scaleY;
+
+                // Arrow end point
+                const endX = screenX + dirX * len;
+                const endY = screenY + dirY * len;
+
+                // Color by direction (hue based on angle)
+                const angle = Math.atan2(ny, nx);
+                const hue = ((angle + Math.PI) / (2 * Math.PI)) * 360;
+                ctx.strokeStyle = `hsla(${hue}, 80%, 60%, 0.9)`;
+                ctx.fillStyle = `hsla(${hue}, 80%, 60%, 0.9)`;
+
+                // Draw arrow line
+                ctx.beginPath();
+                ctx.moveTo(screenX, screenY);
+                ctx.lineTo(endX, endY);
+                ctx.stroke();
+
+                // Draw arrowhead
+                const headAngle = Math.PI / 5;
+                const headSize = 5;
+
+                ctx.beginPath();
+                ctx.moveTo(endX, endY);
+                ctx.lineTo(
+                    endX - headSize * Math.cos(angle - headAngle),
+                    endY - headSize * Math.sin(angle - headAngle)
+                );
+                ctx.lineTo(
+                    endX - headSize * Math.cos(angle + headAngle),
+                    endY - headSize * Math.sin(angle + headAngle)
+                );
+                ctx.closePath();
+                ctx.fill();
+            }
+        }
+    }
+
     onDestroy(() => {
         if (!browser) return;
         if (animationId) cancelAnimationFrame(animationId);
@@ -510,7 +626,15 @@
         }
     }
 
-    function loop() {
+    function loop(timestamp: number) {
+        // FPS calculation
+        frameCount++;
+        if (timestamp - lastFpsTime >= 1000) {
+            fps = frameCount;
+            frameCount = 0;
+            lastFpsTime = timestamp;
+        }
+
         world.tick();
         render();
         animationId = requestAnimationFrame(loop);
@@ -565,6 +689,14 @@
             ctx.globalAlpha = 1.0;
         }
 
+        // Optionally overlay surface normals
+        if (showNormals && normalCanvas) {
+            ctx.globalAlpha = overlayOpacity;
+            ctx.drawImage(normalCanvas, 0, 0, window.innerWidth, window.innerHeight);
+            renderNormalArrows();
+            ctx.globalAlpha = 1.0;
+        }
+
         // Render drops
         for (let bucket = 0; bucket < BUCKETS; bucket++) {
             for (let trail = 0; trail < TRAILS; trail++) {
@@ -612,6 +744,20 @@
         if (showGround) {
             drawGroundLegend();
         }
+        if (showNormals) {
+            drawNormalLegend();
+        }
+
+        // FPS counter (always show)
+        drawFps();
+    }
+
+    function drawFps() {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(window.innerWidth - 70, 10, 60, 24);
+        ctx.fillStyle = fps >= 55 ? '#4f4' : fps >= 30 ? '#ff4' : '#f44';
+        ctx.font = '14px monospace';
+        ctx.fillText(`${fps} fps`, window.innerWidth - 62, 27);
     }
 
     function drawDepthLegend() {
@@ -749,6 +895,59 @@
         ctx.fillText('ground areas only', legendX, legendY + 48);
     }
 
+    function drawNormalLegend() {
+        const legendX = 20;
+        let legendY = 20;
+        if (showDepth) legendY += 80;
+        if (showFlow) legendY += 100;
+        if (showSegments) legendY += detectedClasses.length * 18 + 50;
+        if (showGround) legendY += 110;
+
+        const legendW = 200;
+        const legendH = 80;
+
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(legendX - 10, legendY - 30, legendW + 20, legendH + 50);
+
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px monospace';
+        ctx.fillText('Surface Normals', legendX, legendY - 10);
+
+        ctx.font = '11px monospace';
+        ctx.fillText('Color = normal direction', legendX, legendY + 10);
+        ctx.fillText('Arrows = surface tilt', legendX, legendY + 24);
+
+        // Draw color wheel legend
+        const wheelX = legendX + 140;
+        const wheelY = legendY + 55;
+        const wheelR = 25;
+
+        // Draw direction labels
+        ctx.font = '10px monospace';
+        ctx.fillStyle = '#f88';
+        ctx.fillText('→', wheelX + wheelR + 5, wheelY + 4);
+        ctx.fillStyle = '#8f8';
+        ctx.fillText('↓', wheelX - 3, wheelY + wheelR + 12);
+        ctx.fillStyle = '#88f';
+        ctx.fillText('←', wheelX - wheelR - 12, wheelY + 4);
+        ctx.fillStyle = '#ff8';
+        ctx.fillText('↑', wheelX - 3, wheelY - wheelR - 2);
+
+        // Draw mini color gradient arc
+        for (let a = 0; a < 360; a += 10) {
+            const rad = (a * Math.PI) / 180;
+            ctx.strokeStyle = `hsl(${a}, 80%, 60%)`;
+            ctx.lineWidth = 4;
+            ctx.beginPath();
+            ctx.arc(wheelX, wheelY, wheelR - 2, rad, rad + 0.2);
+            ctx.stroke();
+        }
+
+        ctx.fillStyle = '#aaa';
+        ctx.font = '10px monospace';
+        ctx.fillText('Splashes follow normal', legendX, legendY + 85);
+    }
+
     function handleKeydown(e: KeyboardEvent) {
         if (e.key === 'd' || e.key === 'D') {
             showDepth = !showDepth;
@@ -758,9 +957,11 @@
             showSegments = !showSegments;
         } else if (e.key === 'g' || e.key === 'G') {
             showGround = !showGround;
-        } else if (e.key === 'ArrowUp' && (showDepth || showFlow || showSegments || showGround)) {
+        } else if (e.key === 'n' || e.key === 'N') {
+            showNormals = !showNormals;
+        } else if (e.key === 'ArrowUp' && (showDepth || showFlow || showSegments || showGround || showNormals)) {
             overlayOpacity = Math.min(1, overlayOpacity + 0.1);
-        } else if (e.key === 'ArrowDown' && (showDepth || showFlow || showSegments || showGround)) {
+        } else if (e.key === 'ArrowDown' && (showDepth || showFlow || showSegments || showGround || showNormals)) {
             overlayOpacity = Math.max(0, overlayOpacity - 0.1);
         }
     }
@@ -775,7 +976,8 @@
         <p>Press <kbd>F</kbd> to toggle flow field</p>
         <p>Press <kbd>S</kbd> to toggle segmentation</p>
         <p>Press <kbd>G</kbd> to toggle ground mask</p>
-        {#if showDepth || showFlow || showSegments || showGround}
+        <p>Press <kbd>N</kbd> to toggle surface normals</p>
+        {#if showDepth || showFlow || showSegments || showGround || showNormals}
             <p>Press <kbd>Up/Down</kbd> to adjust opacity</p>
         {/if}
     </div>
