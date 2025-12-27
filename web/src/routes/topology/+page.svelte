@@ -1,14 +1,14 @@
 <script lang="ts">
     import { onMount, onDestroy } from 'svelte';
     import { browser } from '$app/environment';
-    import { BG_PALETTE, BG_PIXELS, BG_GROUND } from '$lib/background';
+    import { BG_PALETTE, BG_PIXELS, BG_GROUND } from '$lib/scene';
     import {
         BG_WIDTH,
         BG_HEIGHT,
         getHeight,
         sampleFlowField,
         sampleNormals
-    } from '$lib/terrain';
+    } from '$lib/world';
 
     // -----------------------------------------------------------------------------
     // State

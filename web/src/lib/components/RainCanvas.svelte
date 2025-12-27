@@ -2,7 +2,7 @@
     import { onMount, onDestroy } from "svelte";
     import { browser } from "$app/environment";
     import { createWorld, getMemory, type RainWorld } from "$lib/wasm/dropletEngine";
-    import { BG_WIDTH, BG_HEIGHT, BG_PALETTE, BG_PIXELS, BG_DEPTH, BG_FLOW_X, BG_FLOW_Y, BG_SEGMENTS, BG_GROUND } from "$lib/background";
+    import { BG_WIDTH, BG_HEIGHT, BG_PALETTE, BG_PIXELS, BG_DEPTH, BG_FLOW_X, BG_FLOW_Y, BG_SEGMENTS, BG_GROUND } from "$lib/scene";
 
     let canvas: HTMLCanvasElement;
     let ctx: CanvasRenderingContext2D;

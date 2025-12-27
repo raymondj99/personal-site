@@ -5,7 +5,7 @@
  * No rendering code - just math.
  */
 
-import { BG_WIDTH, BG_HEIGHT, BG_DEPTH, BG_GROUND } from './background';
+import { BG_WIDTH, BG_HEIGHT, BG_DEPTH, BG_GROUND } from '../scene';
 
 // -----------------------------------------------------------------------------
 // Types
