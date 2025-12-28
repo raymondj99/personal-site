@@ -17,7 +17,7 @@ Carmack-style design: clear layers, minimal abstraction, data-oriented.
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
 │  world/ - Terrain queries (pure functions)                  │
-│  get_depth(), get_flow(), hits_surface(), has_flow()        │
+│  hits_surface(), get_flow(), has_flow(), get_normal()       │
 └─────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -39,7 +39,8 @@ Auto-generated data from AI analysis. Do not edit manually.
 
 ### `world/`
 Pure functions to query scene geometry. No state, no allocation.
-- `terrain.rs` - Depth, height, ground mask, surface collision
+All hot-path functions use `#[inline(always)]` for performance.
+- `terrain.rs` - Surface collision, normals
 - `flow.rs` - Flow direction and magnitude
 
 ### `sim/`
@@ -62,6 +63,22 @@ Mirror of Rust scene data for client-side use.
 ### `world/`
 Terrain query functions for 3D topology viewer.
 - `terrain.ts` - Height, flow, normals (pure functions)
+
+### `components/`
+Svelte components for rendering.
+- `RainCanvas.svelte` - Main rain simulation canvas with debug overlays
+- `AsciiCanvas.svelte` - Alternative ASCII renderer
+
+### Debug Overlays
+Press keys to toggle visualization overlays:
+- `D` - Depth map (MiDaS output)
+- `F` - Flow field arrows
+- `S` - Semantic segmentation (ADE20K classes)
+- `G` - Ground mask
+- `N` - Surface normals (color + arrows)
+- `↑/↓` - Adjust overlay opacity
+
+FPS counter always visible in top-right corner.
 
 ## Design Principles
 

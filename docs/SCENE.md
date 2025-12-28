@@ -107,6 +107,12 @@ normal = normalize(-dz/dx, -dz/dy, 1)
 
 Packed as i8: `nx = normal.x * 127`
 
+**Usage in simulation:**
+- Splash direction biased by normal x-component
+- Surfaces tilting right → right-bursting splashes
+- Surfaces tilting left → left-bursting splashes
+- See SIMULATION.md for details
+
 ## Usage
 
 Run the pipeline:

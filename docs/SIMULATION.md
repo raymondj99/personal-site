@@ -46,8 +46,8 @@ struct Droplets {
 ```
 v = lerp(VEL_NEAR, VEL_FAR, z) * random(0.8, 1.2)
 
-VEL_NEAR = 1.2  (near drops fall fast)
-VEL_FAR  = 0.25 (far drops fall slow)
+VEL_NEAR = 1.7   (near drops fall fast)
+VEL_FAR  = 0.35  (far drops fall slow)
 ```
 
 ### Splashes
@@ -71,6 +71,27 @@ struct Splashes {
 - 1: Left burst
 - 2: Right burst
 - 3: Spray (scattered)
+
+**Surface Normal Influence:**
+
+When a drop hits a surface, the splash direction is biased by the surface normal:
+
+```rust
+// Horizontal drift follows normal x-component
+dir = nx * 6.0 + random(-1, 1)
+
+// Splash type probability scales with tilt
+dir_prob = 0.3 + |nx| * 0.6
+
+if random() < dir_prob {
+    typ = if nx < 0 { LEFT_BURST } else { RIGHT_BURST }
+} else {
+    typ = CROWN or SPRAY
+}
+```
+
+Even slight surface tilts bias splash direction. A surface tilting right
+(positive nx) produces right-bursting splashes with rightward drift.
 
 **Animation:** 24 frames, 8 keyframes (frame/3)
 
@@ -201,3 +222,45 @@ for (y = 0; y < h; y++) {
 ```
 
 Characters drawn in bucket order (far to near) for correct occlusion.
+
+## Performance
+
+### Entity Limits
+```
+MAX_DROPS    = 3000
+MAX_SPLASHES = 200
+MAX_STREAMS  = 500
+```
+
+### Optimizations
+
+**Structure-of-Arrays (SoA):**
+Entity data stored as separate arrays per component, not array of structs.
+This maximizes cache hits when iterating over a single component (e.g., all positions).
+
+**Inline Hot Paths:**
+World query functions (`hits_surface`, `get_flow`, `has_flow`, `get_normal`)
+use `#[inline(always)]` to eliminate function call overhead.
+
+**XORshift RNG:**
+Fast pseudo-random number generator (~3 cycles, no branching):
+```rust
+fn rand(rng: &mut u32) -> f32 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 17;
+    *rng ^= *rng << 5;
+    (*rng >> 8) as f32 * (1.0 / 16777216.0)
+}
+```
+
+**Swap Removal:**
+Dead entities removed by overwriting with live entities from end of array.
+O(1) removal, maintains contiguous iteration.
+
+**Pre-computed Scale Factors:**
+Screen-to-background coordinate conversion factors computed once on resize,
+not per-entity per-frame.
+
+### FPS Monitoring
+Client-side FPS counter updates every second via `requestAnimationFrame` timestamp.
+Color-coded: green (≥55), yellow (≥30), red (<30).
